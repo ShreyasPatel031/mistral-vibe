@@ -2777,6 +2777,7 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         reset_middleware: bool = True,
         switch_to_agent: str | None = None,
         reload_hooks: bool = False,
+        reload_config: bool = False,
     ) -> None:
         self._reload_generation += 1
         generation = self._reload_generation
@@ -2793,9 +2794,10 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         if generation != self._reload_generation:
             return
 
-        # Callers mutate the orchestrator (reload / set_field) before reinit; pick
-        # up whatever config it now holds.
-        self.agent_manager.invalidate_config()
+        if reload_config:
+            await self.refresh_config()
+        else:
+            self.agent_manager.invalidate_config()
         if max_turns is not None:
             self._max_turns = max_turns
         if max_price is not None:

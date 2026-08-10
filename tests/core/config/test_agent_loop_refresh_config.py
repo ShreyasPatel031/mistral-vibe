@@ -123,3 +123,27 @@ async def test_refresh_config_creates_mcp_registry_when_first_server_added(
 
     assert agent_loop.mcp_registry is registry
     assert registry.status() == {"linear": AuthStatus.NEEDS_AUTH}
+
+
+@pytest.mark.asyncio
+async def test_reload_with_initial_messages_picks_up_new_models(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent_loop = build_test_agent_loop(config=build_test_vibe_config())
+    assert "new-model" not in agent_loop.config.models
+
+    refreshed_config = build_test_vibe_config(
+        models={
+            **agent_loop.config.models,
+            "new-model": {
+                "name": "new-model-name",
+                "provider": "mistral",
+                "alias": "new-model",
+            },
+        }
+    )
+    stub_config_reload(monkeypatch, refreshed_config)
+
+    await agent_loop.reload_with_initial_messages(reload_config=True)
+
+    assert "new-model" in agent_loop.config.models

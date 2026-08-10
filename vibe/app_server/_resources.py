@@ -593,8 +593,9 @@ class ResourceRequestHandler:
             logger.debug("Admin config refresh failed on reload", exc_info=exc)
         if params.reload_runtime:
             self._clear_mcp_discovery_errors()
-            await self._agent_loop.config_orchestrator.reload()
-            await self._agent_loop.reload_with_initial_messages(reload_hooks=True)
+            await self._agent_loop.reload_with_initial_messages(
+                reload_hooks=True, reload_config=True
+            )
         else:
             await self._agent_loop.refresh_config()
         return self._config_mutation_response()
