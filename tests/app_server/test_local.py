@@ -999,6 +999,76 @@ async def test_resume_builds_an_independent_backend(
         await source.telemetry_client.aclose()
 
 
+@pytest.mark.asyncio
+async def test_resume_root_loads_session_in_worker_thread(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    logging = SessionLoggingConfig(
+        enabled=True, save_dir=str(tmp_path / "sessions"), session_prefix="session"
+    )
+    source = build_test_agent_loop(
+        config=build_test_vibe_config(session_logging=logging)
+    )
+    await source.persist_empty_session()
+    event_loop_thread = threading.get_ident()
+    load_thread: int | None = None
+    original_load_session = runtime.SessionLoader.load_session
+
+    def load_session(session_dir: Path):
+        nonlocal load_thread
+        load_thread = threading.get_ident()
+        return original_load_session(session_dir)
+
+    monkeypatch.setattr(runtime.SessionLoader, "load_session", load_session)
+    replacement = await runtime.AgentRuntimeFactory().resume_root(
+        source, source.session_id
+    )
+    try:
+        assert load_thread is not None
+        assert load_thread != event_loop_thread
+    finally:
+        await replacement.aclose()
+        await replacement.telemetry_client.aclose()
+        await source.aclose()
+        await source.telemetry_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_continue_resolves_latest_session_in_worker_thread(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config = build_test_vibe_config(
+        session_logging=SessionLoggingConfig(enabled=True, save_dir=str(tmp_path))
+    )
+    session_path = tmp_path / "latest"
+    session_path.mkdir()
+    event_loop_thread = threading.get_ident()
+    resolve_thread: int | None = None
+
+    def find_latest_session(*_args, **_kwargs):
+        nonlocal resolve_thread
+        resolve_thread = threading.get_ident()
+        return session_path
+
+    monkeypatch.setattr(runtime.last_session_pointer, "load", lambda _config: None)
+    monkeypatch.setattr(
+        runtime.SessionLoader, "find_latest_session", find_latest_session
+    )
+    monkeypatch.setattr(
+        runtime.SessionLoader,
+        "load_session",
+        lambda _path: ([], {"session_id": "latest-id"}),
+    )
+    source = cast(AgentLoop, SimpleNamespace(config=config))
+
+    assert (
+        await runtime.AgentRuntimeFactory().resolve_latest(source, Path.cwd())
+        == "latest-id"
+    )
+    assert resolve_thread is not None
+    assert resolve_thread != event_loop_thread
+
+
 def test_continue_prefers_valid_terminal_session_pointer(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -1013,8 +1083,9 @@ def test_continue_prefers_valid_terminal_session_pointer(
         lambda *_args, **_kwargs: session_path,
     )
 
-    source = cast(AgentLoop, SimpleNamespace(config=config))
-    assert runtime.AgentRuntimeFactory().resolve_latest(source, Path.cwd()) == "saved"
+    assert (
+        runtime.AgentRuntimeFactory().resolve_latest_sync(config, Path.cwd()) == "saved"
+    )
 
 
 def test_continue_falls_back_to_latest_session_for_working_directory(
@@ -1039,17 +1110,15 @@ def test_continue_falls_back_to_latest_session_for_working_directory(
         lambda _path: ([], {"session_id": "latest-id"}),
     )
 
-    source = cast(AgentLoop, SimpleNamespace(config=config))
     assert (
-        runtime.AgentRuntimeFactory().resolve_latest(source, Path.cwd()) == "latest-id"
+        runtime.AgentRuntimeFactory().resolve_latest_sync(config, Path.cwd())
+        == "latest-id"
     )
 
 
 def test_continue_requires_session_logging() -> None:
     config = build_test_vibe_config(session_logging=SessionLoggingConfig(enabled=False))
-    source = cast(AgentLoop, SimpleNamespace(config=config))
-
     with pytest.raises(
         runtime.RuntimeSessionNotFoundError, match="Session logging is disabled"
     ):
-        runtime.AgentRuntimeFactory().resolve_latest(source, Path.cwd())
+        runtime.AgentRuntimeFactory().resolve_latest_sync(config, Path.cwd())

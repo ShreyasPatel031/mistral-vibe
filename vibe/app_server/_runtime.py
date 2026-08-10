@@ -249,13 +249,21 @@ class HarnessServer:
 
 
 class AgentRuntimeFactory:
-    def resolve_latest(self, source: AgentLoop, cwd: Path) -> str:
-        _require_session_logging(source.config)
-        return _find_session_to_continue(source.config, cwd=cwd)
+    async def resolve_latest(self, source: AgentLoop, cwd: Path) -> str:
+        return await asyncio.to_thread(self.resolve_latest_sync, source.config, cwd)
+
+    def resolve_latest_sync(self, config: VibeConfigSchema, cwd: Path) -> str:
+        _require_session_logging(config)
+        return _find_session_to_continue(config, cwd=cwd)
+
+    async def resolve_latest_sync_threaded(
+        self, config: VibeConfigSchema, cwd: Path
+    ) -> str:
+        return await asyncio.to_thread(self.resolve_latest_sync, config, cwd)
 
     async def resume_root(self, source: AgentLoop, session_id: str) -> AgentLoop:
-        session_path, loaded_messages, metadata = _load_session(
-            source.config, session_id
+        session_path, loaded_messages, metadata = await asyncio.to_thread(
+            _load_session, source.config, session_id
         )
         replacement = self._create_like(
             source,
@@ -271,8 +279,8 @@ class AgentRuntimeFactory:
     async def resume_blueprint(
         self, blueprint: _RootRuntimeBlueprint, session_id: str
     ) -> AgentLoop:
-        session_path, loaded_messages, metadata = _load_session(
-            blueprint.config, session_id
+        session_path, loaded_messages, metadata = await asyncio.to_thread(
+            _load_session, blueprint.config, session_id
         )
         replacement = blueprint.build(
             parent_session_id=_parent_session_id(metadata),
@@ -357,7 +365,9 @@ class AgentRuntimeFactory:
     async def resume_child(
         self, parent: AgentLoop, agent_name: str, session_id: str, session_dir: Path
     ) -> AgentLoop:
-        loaded_messages, metadata = SessionLoader.load_session(session_dir)
+        loaded_messages, metadata = await asyncio.to_thread(
+            SessionLoader.load_session, session_dir
+        )
         child = await self.create_child(
             parent, agent_name, session_id=session_id, session_dir=session_dir
         )
@@ -513,8 +523,8 @@ class HarnessProcess:
             )
             session_id = request.session_id
             if request.continue_latest:
-                session_id = _find_session_to_continue(
-                    blueprint.config, cwd=blueprint.cwd
+                session_id = await self.runtime_factory.resolve_latest_sync_threaded(
+                    blueprint.config, blueprint.cwd
                 )
             if session_id is not None:
                 return await self.runtime_factory.resume_blueprint(
