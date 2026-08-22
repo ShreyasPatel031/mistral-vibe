@@ -199,6 +199,55 @@ class TestBuildResult:
         assert result.final_url == "https://example.com"
 
 
+class TestResolveHeadless:
+    def test_show_browser_true_is_headed(self):
+        tool = _tool()
+        assert not tool._resolve_headless(
+            ComputerUseArgs(url="https://example.com", task="t", show_browser=True)
+        )
+
+    def test_show_browser_false_is_headless(self):
+        tool = _tool()
+        assert tool._resolve_headless(
+            ComputerUseArgs(url="https://example.com", task="t", show_browser=False)
+        )
+
+    def test_env_headless_overrides(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setenv("COMPUTER_USE_HEADLESS", "1")
+        tool = _tool()
+        assert tool._resolve_headless(
+            ComputerUseArgs(url="https://example.com", task="t", show_browser=True)
+        )
+
+
+class TestBrowserProfile:
+    def test_disables_extensions_and_slow_features(self):
+        captured: dict[str, Any] = {}
+
+        def factory(**kwargs: Any) -> Any:
+            captured.update(kwargs)
+            return kwargs
+
+        _tool()._make_browser_profile(headless=True, profile_factory=factory)
+        assert captured["enable_default_extensions"] is False
+        assert captured["captcha_solver"] is False
+        assert captured["highlight_elements"] is False
+        assert captured["keep_alive"] is False
+        assert captured["headless"] is True
+        assert captured["demo_mode"] is False
+
+    def test_headed_enables_demo_mode(self):
+        captured: dict[str, Any] = {}
+
+        def factory(**kwargs: Any) -> Any:
+            captured.update(kwargs)
+            return kwargs
+
+        _tool()._make_browser_profile(headless=False, profile_factory=factory)
+        assert captured["headless"] is False
+        assert captured["demo_mode"] is True
+
+
 class TestPrompt:
     def test_includes_url_task_and_intent(self):
         prompt = ComputerUse._build_prompt(

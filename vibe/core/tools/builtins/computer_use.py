@@ -217,6 +217,13 @@ class ComputerUse(
             headless=headless,
             demo_mode=not headless,
             disable_security=True,
+            enable_default_extensions=False,
+            captcha_solver=False,
+            highlight_elements=False,
+            keep_alive=False,
+            minimum_wait_page_load_time=0.5,
+            wait_for_network_idle_page_load_time=0.5,
+            wait_between_actions=0.25,
             window_size={
                 "width": self.config.viewport_width,
                 "height": self.config.viewport_height,
@@ -297,6 +304,9 @@ class ComputerUse(
             else f"Opening {url} (headless) …"
         )
         yield self._stream_event(open_msg, ctx)
+        yield self._stream_event(
+            "Launching Chromium (extensions disabled for speed)…", ctx
+        )
 
         agent = self._create_agent(
             url, args, api_key, headless, agent_factory, chat_factory, profile_factory
@@ -358,9 +368,14 @@ class ComputerUse(
             except TimeoutError:
                 elapsed += _HEARTBEAT_SECONDS
                 done = completed_steps_ref()
+                phase = (
+                    "launching browser"
+                    if done == 0 and elapsed < 45
+                    else "waiting on browser/model"
+                )
                 yield (
                     f"… still working ({int(elapsed)}s, "
-                    f"step {done + 1}/{max_steps}, waiting on browser/model)"
+                    f"step {done + 1}/{max_steps}, {phase})"
                 )
         while not progress.empty():
             yield progress.get_nowait()
