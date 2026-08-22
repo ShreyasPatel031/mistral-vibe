@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncGenerator
 import importlib.util
+import os
 from typing import TYPE_CHECKING, Any, final
 from urllib.parse import urlparse
 
@@ -31,8 +32,10 @@ if TYPE_CHECKING:
     from vibe.core.types import ToolCallEvent, ToolResultEvent
 
 _MISTRAL_API_BASE = "https://api.mistral.ai/v1"
-_STEP_CAP = 60
-_STEP_POLL_SECONDS = 0.5
+_STEP_CAP = 40
+_WALL_TIMEOUT_SECONDS = 120
+_HEARTBEAT_SECONDS = 3.0
+_QUEUE_POLL_SECONDS = 0.25
 
 
 class ComputerUseStep(BaseModel):
@@ -71,25 +74,27 @@ class ComputerUseConfig(BaseToolConfig):
     permission: ToolPermission = ToolPermission.ASK
 
     model: str = Field(
-        default="mistral-medium-latest",
+        default="mistral-small-latest",
         description="Mistral model driving the browser. Needs vision for screenshots.",
     )
     api_base: str = Field(
         default=_MISTRAL_API_BASE, description="OpenAI-compatible Mistral endpoint."
     )
     max_steps: int = Field(
-        default=25, description="Default step budget for a single task."
+        default=12, description="Default step budget for a single task."
     )
     headless: bool = Field(
         default=True, description="Run Chromium headless. Set false to watch the run."
     )
     viewport_width: int = Field(default=1280)
     viewport_height: int = Field(default=800)
+    wall_timeout_seconds: int = Field(
+        default=_WALL_TIMEOUT_SECONDS,
+        description="Hard cap on wall time for one browser task.",
+    )
 
 
 def _is_meaningful(value: Any) -> bool:
-    # Action arguments can be lists, so membership tests against a set would raise
-    # on unhashable values.
     if value is None or value is False:
         return False
     if isinstance(value, str | list | dict | tuple) and not value:
@@ -141,6 +146,15 @@ def _step_from_history_item(item: Any, step_no: int) -> ComputerUseStep:
     )
 
 
+def _format_step_message(step: ComputerUseStep, max_steps: int) -> str:
+    lines = [f"Step {step.step}/{max_steps}: {step.action}"]
+    if step.url:
+        lines.append(f"  @ {step.url}")
+    if step.thought:
+        lines.append(f"  → {step.thought}")
+    return "\n".join(lines)
+
+
 class ComputerUse(
     BaseTool[ComputerUseArgs, ComputerUseResult, ComputerUseConfig, BaseToolState],
     ToolUIData[ComputerUseArgs, ComputerUseResult],
@@ -179,13 +193,17 @@ class ComputerUse(
             ],
         )
 
+    def _stream_event(self, message: str, ctx: InvokeContext | None) -> ToolStreamEvent:
+        return ToolStreamEvent(
+            tool_name=self.get_name(),
+            message=message if message.endswith("\n") else f"{message}\n",
+            tool_call_id=ctx.tool_call_id if ctx else "",
+        )
+
     @final
     async def run(
         self, args: ComputerUseArgs, ctx: InvokeContext | None = None
     ) -> AsyncGenerator[ToolStreamEvent | ComputerUseResult, None]:
-        # Resolved at call time, not imported at module scope: browser-use is an
-        # optional dependency that also drags in Playwright, so a static import would
-        # both break installs without it and slow every CLI start.
         if importlib.util.find_spec("browser_use") is None:
             raise ToolError(
                 "browser-use is not installed. Install it with "
@@ -207,6 +225,12 @@ class ComputerUse(
         url = self._normalize_url(args.url)
         self._validate_url(url)
         max_steps = min(args.max_steps or self.config.max_steps, _STEP_CAP)
+        wall_timeout = self.config.wall_timeout_seconds
+
+        os.environ.setdefault("BROWSER_USE_STEP_TIMEOUT", "45")
+        os.environ.setdefault("BROWSER_USE_ACTION_TIMEOUT_S", "60")
+
+        yield self._stream_event(f"Opening {url} …", ctx)
 
         agent = agent_factory(
             task=self._build_prompt(url, args),
@@ -215,6 +239,8 @@ class ComputerUse(
                 api_key=api_key,
                 base_url=self.config.api_base,
                 temperature=0,
+                max_retries=4,
+                timeout=90.0,
             ),
             browser_profile=browser_profile_factory(
                 headless=self.config.headless,
@@ -224,47 +250,75 @@ class ComputerUse(
                 },
             ),
             use_vision=True,
+            use_judge=False,
+            max_actions_per_step=2,
             calculate_cost=True,
+            extend_system_message=(
+                "Complete the task in as few steps as possible. "
+                "Call done as soon as every constraint is satisfied on the page."
+            ),
         )
 
         progress: asyncio.Queue[str] = asyncio.Queue()
+        completed_steps = 0
 
         async def on_step_end(running_agent: Any) -> None:
+            nonlocal completed_steps
             history = getattr(running_agent, "history", None)
             items = list(getattr(history, "history", None) or [])
             if not items:
                 return
-            step = _step_from_history_item(items[-1], len(items))
-            label = step.thought or step.action
-            await progress.put(f"step {step.step}/{max_steps}: {label}")
+            completed_steps = len(items)
+            step = _step_from_history_item(items[-1], completed_steps)
+            await progress.put(_format_step_message(step, max_steps))
 
         run_task = asyncio.create_task(
             agent.run(max_steps=max_steps, on_step_end=on_step_end)
         )
 
-        async for message in self._drain(progress, run_task):
-            yield ToolStreamEvent(
-                tool_name=self.get_name(),
-                message=message,
-                tool_call_id=ctx.tool_call_id if ctx else "",
-            )
-
         try:
-            history = await run_task
+            async for message in self._drain_with_heartbeat(
+                progress,
+                run_task,
+                max_steps,
+                completed_steps_ref=lambda: completed_steps,
+            ):
+                yield self._stream_event(message, ctx)
+
+            history = await asyncio.wait_for(run_task, timeout=wall_timeout)
+        except TimeoutError:
+            run_task.cancel()
+            raise ToolError(
+                f"Browser task timed out after {wall_timeout}s. "
+                "Try a simpler task or raise max_steps."
+            ) from None
         except Exception as exc:
+            run_task.cancel()
             raise ToolError(f"Browser agent failed: {exc}") from exc
 
-        yield self._build_result(history, url, args, max_steps)
+        result = self._build_result(history, url, args, max_steps)
+        yield self._stream_event(self._format_completion_message(result), ctx)
+        yield result
 
     @staticmethod
-    async def _drain(
-        progress: asyncio.Queue[str], run_task: asyncio.Task[Any]
+    async def _drain_with_heartbeat(
+        progress: asyncio.Queue[str],
+        run_task: asyncio.Task[Any],
+        max_steps: int,
+        *,
+        completed_steps_ref: Any,
     ) -> AsyncGenerator[str, None]:
+        elapsed = 0.0
         while not run_task.done():
             try:
-                yield await asyncio.wait_for(progress.get(), _STEP_POLL_SECONDS)
+                yield await asyncio.wait_for(progress.get(), _HEARTBEAT_SECONDS)
             except TimeoutError:
-                continue
+                elapsed += _HEARTBEAT_SECONDS
+                done = completed_steps_ref()
+                yield (
+                    f"… still working ({int(elapsed)}s, "
+                    f"step {done + 1}/{max_steps}, waiting on browser/model)"
+                )
         while not progress.empty():
             yield progress.get_nowait()
 
@@ -288,8 +342,8 @@ class ComputerUse(
             "rather than typing every constraint into a search box."
         )
         lines.append(
-            "Do not stop until every part of the task is satisfied on the page, "
-            "and report what you could not do."
+            "Stop as soon as every part of the task is satisfied on the page. "
+            "Call done immediately when finished."
         )
         return "\n".join(lines)
 
@@ -314,6 +368,30 @@ class ComputerUse(
             num_steps=len(steps),
             budget_exhausted=len(steps) >= max_steps and not completed,
         )
+
+    @staticmethod
+    def _format_completion_message(result: ComputerUseResult) -> str:
+        status = "completed" if result.completed else "stopped"
+        lines = [
+            f"Done ({status}) — {result.num_steps} steps",
+            f"Final page: {result.final_url}",
+        ]
+        if result.summary:
+            lines.append(result.summary.strip())
+        return "\n".join(lines)
+
+    def get_result_extra(self, result: ComputerUseResult) -> str | None:
+        lines = [
+            "Browser trace:",
+            *[
+                f"  {s.step}. {s.action}" + (f" @ {s.url}" if s.url else "")
+                for s in result.steps
+            ],
+        ]
+        if result.summary:
+            lines.append(f"Summary: {result.summary.strip()}")
+        lines.append(f"Final: {result.final_url}")
+        return "\n".join(lines)
 
     @classmethod
     def get_call_display(cls, event: ToolCallEvent) -> ToolCallDisplay:
@@ -344,13 +422,16 @@ class ComputerUse(
             )
 
         result = event.result
-        message = f"{result.final_url} ({result.num_steps} steps)"
+        snippet = result.summary.strip().split("\n")[0][:80] if result.summary else ""
+        message = result.final_url
+        if snippet:
+            message = f"{result.final_url} — {snippet}"
         if result.budget_exhausted:
             return ToolResultDisplay(
                 success=False,
                 verb="Ran out of steps",
                 message=message,
-                suffix=f"(budget {result.num_steps})",
+                suffix=f"({result.num_steps} steps)",
             )
         return ToolResultDisplay(
             success=result.completed,
@@ -360,7 +441,7 @@ class ComputerUse(
 
     @classmethod
     def get_status_text(cls) -> str:
-        return "Driving browser"
+        return "Starting browser…"
 
 
 def _call_or_default(target: Any, method_name: str, default: Any) -> Any:
