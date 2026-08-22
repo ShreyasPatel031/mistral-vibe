@@ -57,6 +57,10 @@ class ComputerUseArgs(BaseModel):
     max_steps: int | None = Field(
         default=None, description="Override the configured step budget for this run."
     )
+    show_browser: bool = Field(
+        default=True,
+        description="Open a visible Chromium window so you can watch the agent work.",
+    )
 
 
 class ComputerUseResult(BaseModel):
@@ -84,7 +88,8 @@ class ComputerUseConfig(BaseToolConfig):
         default=12, description="Default step budget for a single task."
     )
     headless: bool = Field(
-        default=True, description="Run Chromium headless. Set false to watch the run."
+        default=False,
+        description="Hide the browser window. Prefer show_browser=false on each call instead.",
     )
     viewport_width: int = Field(default=1280)
     viewport_height: int = Field(default=800)
@@ -200,6 +205,65 @@ class ComputerUse(
             tool_call_id=ctx.tool_call_id if ctx else "",
         )
 
+    def _resolve_headless(self, args: ComputerUseArgs) -> bool:
+        if os.environ.get("COMPUTER_USE_HEADLESS", "").lower() in {"1", "true", "yes"}:
+            return True
+        if os.environ.get("COMPUTER_USE_HEADED", "").lower() in {"1", "true", "yes"}:
+            return False
+        return not args.show_browser
+
+    def _make_browser_profile(self, headless: bool, profile_factory: Any) -> Any:
+        return profile_factory(
+            headless=headless,
+            demo_mode=not headless,
+            disable_security=True,
+            window_size={
+                "width": self.config.viewport_width,
+                "height": self.config.viewport_height,
+            },
+            viewport={
+                "width": self.config.viewport_width,
+                "height": self.config.viewport_height,
+            },
+        )
+
+    @staticmethod
+    def _load_browser_modules() -> tuple[Any, Any, Any]:
+        browser_use = importlib.import_module("browser_use")
+        profile_module = importlib.import_module("browser_use.browser.profile")
+        return browser_use.Agent, browser_use.ChatOpenAI, profile_module.BrowserProfile
+
+    def _create_agent(
+        self,
+        url: str,
+        args: ComputerUseArgs,
+        api_key: str,
+        headless: bool,
+        agent_factory: Any,
+        chat_factory: Any,
+        profile_factory: Any,
+    ) -> Any:
+        return agent_factory(
+            task=self._build_prompt(url, args),
+            llm=chat_factory(
+                model=self.config.model,
+                api_key=api_key,
+                base_url=self.config.api_base,
+                temperature=0,
+                max_retries=4,
+                timeout=90.0,
+            ),
+            browser_profile=self._make_browser_profile(headless, profile_factory),
+            use_vision=True,
+            use_judge=False,
+            max_actions_per_step=2,
+            calculate_cost=True,
+            extend_system_message=(
+                "Complete the task in as few steps as possible. "
+                "Call done as soon as every constraint is satisfied on the page."
+            ),
+        )
+
     @final
     async def run(
         self, args: ComputerUseArgs, ctx: InvokeContext | None = None
@@ -210,11 +274,7 @@ class ComputerUse(
                 "`uv pip install browser-use` then `playwright install chromium`."
             )
 
-        browser_use = importlib.import_module("browser_use")
-        profile_module = importlib.import_module("browser_use.browser.profile")
-        agent_factory = browser_use.Agent
-        chat_factory = browser_use.ChatOpenAI
-        browser_profile_factory = profile_module.BrowserProfile
+        agent_factory, chat_factory, profile_factory = self._load_browser_modules()
 
         api_key = resolve_api_key(DEFAULT_MISTRAL_API_ENV_KEY)
         if not api_key:
@@ -230,33 +290,16 @@ class ComputerUse(
         os.environ.setdefault("BROWSER_USE_STEP_TIMEOUT", "45")
         os.environ.setdefault("BROWSER_USE_ACTION_TIMEOUT_S", "60")
 
-        yield self._stream_event(f"Opening {url} …", ctx)
+        headless = self._resolve_headless(args)
+        open_msg = (
+            f"Opening visible browser → {url} …"
+            if not headless
+            else f"Opening {url} (headless) …"
+        )
+        yield self._stream_event(open_msg, ctx)
 
-        agent = agent_factory(
-            task=self._build_prompt(url, args),
-            llm=chat_factory(
-                model=self.config.model,
-                api_key=api_key,
-                base_url=self.config.api_base,
-                temperature=0,
-                max_retries=4,
-                timeout=90.0,
-            ),
-            browser_profile=browser_profile_factory(
-                headless=self.config.headless,
-                viewport={
-                    "width": self.config.viewport_width,
-                    "height": self.config.viewport_height,
-                },
-            ),
-            use_vision=True,
-            use_judge=False,
-            max_actions_per_step=2,
-            calculate_cost=True,
-            extend_system_message=(
-                "Complete the task in as few steps as possible. "
-                "Call done as soon as every constraint is satisfied on the page."
-            ),
+        agent = self._create_agent(
+            url, args, api_key, headless, agent_factory, chat_factory, profile_factory
         )
 
         progress: asyncio.Queue[str] = asyncio.Queue()
@@ -441,7 +484,7 @@ class ComputerUse(
 
     @classmethod
     def get_status_text(cls) -> str:
-        return "Starting browser…"
+        return "Launching Chromium…"
 
 
 def _call_or_default(target: Any, method_name: str, default: Any) -> Any:

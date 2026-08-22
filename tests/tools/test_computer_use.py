@@ -34,7 +34,7 @@ class TestName:
 
     def test_exposes_url_task_and_intent(self):
         properties = ComputerUse.get_parameters()["properties"]
-        assert {"url", "task", "intent", "max_steps"} <= set(properties)
+        assert {"url", "task", "intent", "max_steps", "show_browser"} <= set(properties)
 
 
 class TestNormalizeUrl:

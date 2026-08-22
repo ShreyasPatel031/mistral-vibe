@@ -15,7 +15,8 @@ Parameters:
   under $2500 and report the top 3" works far better than "look at rentals".
 - `intent` — optional. Who the user is and what they are trying to achieve, so the agent
   behaves like that person. Useful for usability checks.
-- `max_steps` — optional override of the configured step budget.
+- `show_browser` — default **true**: opens a real Chromium window on your screen.
+  Set false for headless/server runs, or export `COMPUTER_USE_HEADLESS=1`.
 
 Notes:
 
