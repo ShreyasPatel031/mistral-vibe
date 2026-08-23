@@ -236,7 +236,8 @@ class TestBrowserProfile:
         assert captured["headless"] is True
         assert captured["demo_mode"] is False
 
-    def test_headed_enables_demo_mode(self):
+    def test_headed_never_enables_demo_mode(self):
+        # demo_mode makes browser-use sleep 30s before returning the result.
         captured: dict[str, Any] = {}
 
         def factory(**kwargs: Any) -> Any:
@@ -245,7 +246,7 @@ class TestBrowserProfile:
 
         _tool()._make_browser_profile(headless=False, profile_factory=factory)
         assert captured["headless"] is False
-        assert captured["demo_mode"] is True
+        assert captured["demo_mode"] is False
 
 
 class TestPrompt:

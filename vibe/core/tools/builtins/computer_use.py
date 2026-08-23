@@ -39,6 +39,7 @@ _WALL_TIMEOUT_SECONDS = 120
 _HEARTBEAT_SECONDS = 3.0
 _QUEUE_POLL_SECONDS = 0.25
 _BROWSER_USE_PACKAGE = "browser-use==0.13.8"
+_LAUNCH_PHASE_SECONDS = 45
 
 
 class ComputerUseStep(BaseModel):
@@ -254,7 +255,9 @@ class ComputerUse(
     def _make_browser_profile(self, headless: bool, profile_factory: Any) -> Any:
         return profile_factory(
             headless=headless,
-            demo_mode=not headless,
+            # browser-use sleeps 30s before closing when demo_mode is on, and its
+            # side panel duplicates the step stream we already yield.
+            demo_mode=False,
             disable_security=True,
             enable_default_extensions=False,
             captcha_solver=False,
@@ -413,7 +416,7 @@ class ComputerUse(
                 done = completed_steps_ref()
                 phase = (
                     "launching browser"
-                    if done == 0 and elapsed < 45
+                    if done == 0 and elapsed < _LAUNCH_PHASE_SECONDS
                     else "waiting on browser/model"
                 )
                 yield (
