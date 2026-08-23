@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 from collections.abc import AsyncGenerator
+import contextlib
 import importlib.util
+import json
 import os
 import shutil
 import sys
+import time
 from typing import TYPE_CHECKING, Any, final
 from urllib.parse import urlparse
 
@@ -19,6 +23,10 @@ from vibe.core.tools.base import (
     InvokeContext,
     ToolError,
     ToolPermission,
+)
+from vibe.core.tools.builtins._computer_use_trace import (
+    SENTINEL,
+    step_payload as _step_payload,
 )
 from vibe.core.tools.permissions import (
     PermissionContext,
@@ -37,9 +45,10 @@ _MISTRAL_API_BASE = "https://api.mistral.ai/v1"
 _STEP_CAP = 40
 _WALL_TIMEOUT_SECONDS = 120
 _HEARTBEAT_SECONDS = 3.0
-_QUEUE_POLL_SECONDS = 0.25
 _BROWSER_USE_PACKAGE = "browser-use==0.13.8"
 _LAUNCH_PHASE_SECONDS = 45
+_WORKER_MODULE = "vibe.core.tools.builtins._computer_use_worker"
+_STDERR_TAIL_LINES = 15
 
 
 class ComputerUseStep(BaseModel):
@@ -103,56 +112,8 @@ class ComputerUseConfig(BaseToolConfig):
     )
 
 
-def _is_meaningful(value: Any) -> bool:
-    if value is None or value is False:
-        return False
-    if isinstance(value, str | list | dict | tuple) and not value:
-        return False
-    return True
-
-
-def _action_label(action: Any) -> str:
-    if action is None:
-        return "—"
-    if isinstance(action, list):
-        return "; ".join(_action_label(item) for item in action)
-
-    payload = getattr(action, "root", None) or action
-    dumped = (
-        payload.model_dump(exclude_none=True)
-        if hasattr(payload, "model_dump")
-        else None
-    )
-    if not isinstance(dumped, dict) or not dumped:
-        return str(action)[:200]
-
-    name, arguments = next(iter(dumped.items()))
-    if not isinstance(arguments, dict):
-        return f"{name}: {arguments}"[:200]
-
-    detail = ", ".join(
-        f"{key}={value}" for key, value in arguments.items() if _is_meaningful(value)
-    )
-    return (f"{name} — {detail}" if detail else str(name))[:200]
-
-
-def _thought(model_output: Any) -> str:
-    for field_name in ("next_goal", "evaluation_previous_goal", "thinking"):
-        value = getattr(model_output, field_name, None)
-        if value:
-            return str(value).strip()[:300]
-    return ""
-
-
 def _step_from_history_item(item: Any, step_no: int) -> ComputerUseStep:
-    model_output = getattr(item, "model_output", None)
-    state = getattr(item, "state", None)
-    return ComputerUseStep(
-        step=step_no,
-        action=_action_label(getattr(model_output, "action", None)),
-        thought=_thought(model_output),
-        url=str(getattr(state, "url", "") or ""),
-    )
+    return ComputerUseStep(**_step_payload(item, step_no))
 
 
 def _format_step_message(step: ComputerUseStep, max_steps: int) -> str:
@@ -185,9 +146,7 @@ class ComputerUse(
         else:
             cmd = [sys.executable, "-m", "pip", "install", _BROWSER_USE_PACKAGE]
         proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
         )
         stdout, stderr = await proc.communicate()
         if proc.returncode != 0:
@@ -252,66 +211,24 @@ class ComputerUse(
             return False
         return not args.show_browser
 
-    def _make_browser_profile(self, headless: bool, profile_factory: Any) -> Any:
-        return profile_factory(
-            headless=headless,
-            # browser-use sleeps 30s before closing when demo_mode is on, and its
-            # side panel duplicates the step stream we already yield.
-            demo_mode=False,
-            disable_security=True,
-            enable_default_extensions=False,
-            captcha_solver=False,
-            highlight_elements=False,
-            keep_alive=False,
-            minimum_wait_page_load_time=0.5,
-            wait_for_network_idle_page_load_time=0.5,
-            wait_between_actions=0.25,
-            window_size={
-                "width": self.config.viewport_width,
-                "height": self.config.viewport_height,
-            },
-            viewport={
-                "width": self.config.viewport_width,
-                "height": self.config.viewport_height,
-            },
-        )
-
-    @staticmethod
-    def _load_browser_modules() -> tuple[Any, Any, Any]:
-        browser_use = importlib.import_module("browser_use")
-        profile_module = importlib.import_module("browser_use.browser.profile")
-        return browser_use.Agent, browser_use.ChatOpenAI, profile_module.BrowserProfile
-
-    def _create_agent(
+    def _worker_request(
         self,
         url: str,
         args: ComputerUseArgs,
         api_key: str,
         headless: bool,
-        agent_factory: Any,
-        chat_factory: Any,
-        profile_factory: Any,
-    ) -> Any:
-        return agent_factory(
-            task=self._build_prompt(url, args),
-            llm=chat_factory(
-                model=self.config.model,
-                api_key=api_key,
-                base_url=self.config.api_base,
-                temperature=0,
-                max_retries=4,
-                timeout=90.0,
-            ),
-            browser_profile=self._make_browser_profile(headless, profile_factory),
-            use_vision=True,
-            use_judge=False,
-            max_actions_per_step=2,
-            calculate_cost=True,
-            extend_system_message=(
-                "Complete the task in as few steps as possible. "
-                "Call done as soon as every constraint is satisfied on the page."
-            ),
-        )
+        max_steps: int,
+    ) -> dict[str, Any]:
+        return {
+            "prompt": self._build_prompt(url, args),
+            "api_key": api_key,
+            "api_base": self.config.api_base,
+            "model": self.config.model,
+            "headless": headless,
+            "max_steps": max_steps,
+            "viewport_width": self.config.viewport_width,
+            "viewport_height": self.config.viewport_height,
+        }
 
     @final
     async def run(
@@ -327,8 +244,6 @@ class ComputerUse(
 
         self._ensure_chrome()
 
-        agent_factory, chat_factory, profile_factory = self._load_browser_modules()
-
         api_key = resolve_api_key(DEFAULT_MISTRAL_API_ENV_KEY)
         if not api_key:
             raise ToolError(
@@ -338,93 +253,153 @@ class ComputerUse(
         url = self._normalize_url(args.url)
         self._validate_url(url)
         max_steps = min(args.max_steps or self.config.max_steps, _STEP_CAP)
-        wall_timeout = self.config.wall_timeout_seconds
-
-        os.environ.setdefault("BROWSER_USE_STEP_TIMEOUT", "45")
-        os.environ.setdefault("BROWSER_USE_ACTION_TIMEOUT_S", "60")
-
         headless = self._resolve_headless(args)
-        open_msg = (
-            f"Opening visible browser → {url} …"
-            if not headless
-            else f"Opening {url} (headless) …"
-        )
-        yield self._stream_event(open_msg, ctx)
+
         yield self._stream_event(
-            "Launching Chromium (extensions disabled for speed)…", ctx
+            f"Opening {url} (headless) …"
+            if headless
+            else f"Opening visible browser → {url} …",
+            ctx,
         )
 
-        agent = self._create_agent(
-            url, args, api_key, headless, agent_factory, chat_factory, profile_factory
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-m",
+            _WORKER_MODULE,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=os.getcwd(),
         )
 
-        progress: asyncio.Queue[str] = asyncio.Queue()
-        completed_steps = 0
-
-        async def on_step_end(running_agent: Any) -> None:
-            nonlocal completed_steps
-            history = getattr(running_agent, "history", None)
-            items = list(getattr(history, "history", None) or [])
-            if not items:
-                return
-            completed_steps = len(items)
-            step = _step_from_history_item(items[-1], completed_steps)
-            await progress.put(_format_step_message(step, max_steps))
-
-        run_task = asyncio.create_task(
-            agent.run(max_steps=max_steps, on_step_end=on_step_end)
-        )
-
+        result_payload: dict[str, Any] | None = None
         try:
-            async for message in self._drain_with_heartbeat(
-                progress,
-                run_task,
+            async for message, payload in self._drive_worker(
+                proc,
+                self._worker_request(url, args, api_key, headless, max_steps),
                 max_steps,
-                completed_steps_ref=lambda: completed_steps,
             ):
-                yield self._stream_event(message, ctx)
+                if payload is not None:
+                    result_payload = payload
+                if message:
+                    yield self._stream_event(message, ctx)
+        finally:
+            await self._terminate(proc)
 
-            history = await asyncio.wait_for(run_task, timeout=wall_timeout)
-        except TimeoutError:
-            run_task.cancel()
-            raise ToolError(
-                f"Browser task timed out after {wall_timeout}s. "
-                "Try a simpler task or raise max_steps."
-            ) from None
-        except Exception as exc:
-            run_task.cancel()
-            raise ToolError(f"Browser agent failed: {exc}") from exc
+        if result_payload is None:
+            raise ToolError("Browser agent exited before reporting a result.")
 
-        result = self._build_result(history, url, args, max_steps)
+        result = self._build_result(result_payload, url, args, max_steps)
         yield self._stream_event(self._format_completion_message(result), ctx)
         yield result
 
-    @staticmethod
-    async def _drain_with_heartbeat(
-        progress: asyncio.Queue[str],
-        run_task: asyncio.Task[Any],
-        max_steps: int,
-        *,
-        completed_steps_ref: Any,
-    ) -> AsyncGenerator[str, None]:
-        elapsed = 0.0
-        while not run_task.done():
-            try:
-                yield await asyncio.wait_for(progress.get(), _HEARTBEAT_SECONDS)
-            except TimeoutError:
-                elapsed += _HEARTBEAT_SECONDS
-                done = completed_steps_ref()
-                phase = (
-                    "launching browser"
-                    if done == 0 and elapsed < _LAUNCH_PHASE_SECONDS
-                    else "waiting on browser/model"
-                )
+    async def _drive_worker(
+        self, proc: Any, request: dict[str, Any], max_steps: int
+    ) -> AsyncGenerator[tuple[str | None, dict[str, Any] | None], None]:
+        """Feed the worker its request, then translate its events into messages."""
+        proc.stdin.write(json.dumps(request).encode())
+        await proc.stdin.drain()
+        proc.stdin.close()
+
+        stderr_tail: deque[str] = deque(maxlen=_STDERR_TAIL_LINES)
+        drain = asyncio.create_task(self._drain_stderr(proc, stderr_tail))
+
+        started = time.monotonic()
+        completed_steps = 0
+        try:
+            while True:
+                try:
+                    line = await asyncio.wait_for(
+                        proc.stdout.readline(), _HEARTBEAT_SECONDS
+                    )
+                except TimeoutError:
+                    elapsed = time.monotonic() - started
+                    if elapsed >= self.config.wall_timeout_seconds:
+                        raise ToolError(
+                            f"Browser task timed out after "
+                            f"{self.config.wall_timeout_seconds}s. "
+                            "Try a simpler task or raise max_steps."
+                        ) from None
+                    yield self._heartbeat(elapsed, completed_steps, max_steps), None
+                    continue
+
+                if not line:
+                    break
+
+                event = self._parse_event(line)
+                if event is None:
+                    continue
+                if event.get("type") == "error":
+                    raise ToolError(
+                        f"Browser agent failed: {event.get('message', 'unknown error')}"
+                    )
+                if event.get("type") == "result":
+                    yield None, event
+                    continue
+                completed_steps = int(event.get("step", completed_steps))
                 yield (
-                    f"… still working ({int(elapsed)}s, "
-                    f"step {done + 1}/{max_steps}, {phase})"
+                    _format_step_message(
+                        ComputerUseStep(**{
+                            key: event[key]
+                            for key in ("step", "action", "thought", "url")
+                            if key in event
+                        }),
+                        max_steps,
+                    ),
+                    None,
                 )
-        while not progress.empty():
-            yield progress.get_nowait()
+        finally:
+            drain.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await drain
+
+        if proc.returncode not in {0, None} and stderr_tail:
+            raise ToolError("Browser agent failed: " + " | ".join(stderr_tail))
+
+    @staticmethod
+    def _parse_event(line: bytes) -> dict[str, Any] | None:
+        text = line.decode("utf-8", "replace").strip()
+        if not text.startswith(SENTINEL):
+            return None
+        try:
+            parsed = json.loads(text[len(SENTINEL) :])
+        except json.JSONDecodeError:
+            return None
+        return parsed if isinstance(parsed, dict) else None
+
+    @staticmethod
+    def _heartbeat(elapsed: float, completed_steps: int, max_steps: int) -> str:
+        phase = (
+            "launching browser"
+            if completed_steps == 0 and elapsed < _LAUNCH_PHASE_SECONDS
+            else "waiting on browser/model"
+        )
+        return (
+            f"… still working ({int(elapsed)}s, "
+            f"step {completed_steps + 1}/{max_steps}, {phase})"
+        )
+
+    @staticmethod
+    async def _drain_stderr(proc: Any, tail: deque[str]) -> None:
+        while True:
+            line = await proc.stderr.readline()
+            if not line:
+                return
+            text = line.decode("utf-8", "replace").strip()
+            if text:
+                tail.append(text[:200])
+
+    @staticmethod
+    async def _terminate(proc: Any) -> None:
+        if proc.returncode is not None:
+            return
+        with contextlib.suppress(ProcessLookupError):
+            proc.terminate()
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=5)
+        except TimeoutError:
+            with contextlib.suppress(ProcessLookupError):
+                proc.kill()
 
     def _validate_url(self, url: str) -> None:
         parsed = urlparse(url)
@@ -453,14 +428,13 @@ class ComputerUse(
 
     @staticmethod
     def _build_result(
-        history: Any, url: str, args: ComputerUseArgs, max_steps: int
+        payload: dict[str, Any], url: str, args: ComputerUseArgs, max_steps: int
     ) -> ComputerUseResult:
-        items = list(getattr(history, "history", None) or [])
-        steps = [_step_from_history_item(item, i) for i, item in enumerate(items, 1)]
+        steps = [ComputerUseStep(**step) for step in payload.get("steps") or []]
 
         final_url = next((step.url for step in reversed(steps) if step.url), url)
-        completed = bool(_call_or_default(history, "is_done", False))
-        summary = str(_call_or_default(history, "final_result", "") or "")
+        completed = bool(payload.get("is_done"))
+        summary = str(payload.get("final_result") or "")
 
         return ComputerUseResult(
             url=url,

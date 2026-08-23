@@ -7,13 +7,16 @@ from pydantic import BaseModel
 import pytest
 
 from vibe.core.tools.base import ToolError, ToolPermission
+from vibe.core.tools.builtins._computer_use_trace import (
+    SENTINEL,
+    action_label as _action_label,
+    is_meaningful as _is_meaningful,
+)
 from vibe.core.tools.builtins.computer_use import (
     ComputerUse,
     ComputerUseArgs,
     ComputerUseConfig,
     ComputerUseResult,
-    _action_label,
-    _is_meaningful,
     _step_from_history_item,
 )
 from vibe.core.tools.permissions import PermissionScope
@@ -144,17 +147,20 @@ class TestStepFromHistory:
 
 class TestBuildResult:
     @staticmethod
-    def _history(*, steps: int, done: bool) -> SimpleNamespace:
-        items = [
-            SimpleNamespace(
-                model_output=SimpleNamespace(action=_Root(click=_Click(index=i))),
-                state=SimpleNamespace(url=f"https://example.com/{i}"),
-            )
-            for i in range(steps)
-        ]
-        return SimpleNamespace(
-            history=items, is_done=lambda: done, final_result=lambda: "did the thing"
-        )
+    def _history(*, steps: int, done: bool) -> dict[str, Any]:
+        return {
+            "steps": [
+                {
+                    "step": i + 1,
+                    "action": f"click — index={i}",
+                    "thought": "",
+                    "url": f"https://example.com/{i}",
+                }
+                for i in range(steps)
+            ],
+            "is_done": done,
+            "final_result": "did the thing",
+        }
 
     def test_reports_completion_and_trace(self):
         result = ComputerUse._build_result(
@@ -220,33 +226,43 @@ class TestResolveHeadless:
         )
 
 
-class TestBrowserProfile:
-    def test_disables_extensions_and_slow_features(self):
-        captured: dict[str, Any] = {}
+class TestWorkerRequest:
+    def test_carries_prompt_and_browser_settings(self):
+        request = _tool()._worker_request(
+            "https://example.com",
+            ComputerUseArgs(url="https://example.com", task="buy milk"),
+            api_key="k",
+            headless=False,
+            max_steps=7,
+        )
+        assert "buy milk" in request["prompt"]
+        assert request["api_key"] == "k"
+        assert request["headless"] is False
+        assert request["max_steps"] == 7
 
-        def factory(**kwargs: Any) -> Any:
-            captured.update(kwargs)
-            return kwargs
 
-        _tool()._make_browser_profile(headless=True, profile_factory=factory)
-        assert captured["enable_default_extensions"] is False
-        assert captured["captcha_solver"] is False
-        assert captured["highlight_elements"] is False
-        assert captured["keep_alive"] is False
-        assert captured["headless"] is True
-        assert captured["demo_mode"] is False
+class TestParseEvent:
+    def test_reads_sentinel_prefixed_json(self):
+        line = (SENTINEL + '{"type": "step", "step": 2}\n').encode()
+        assert ComputerUse._parse_event(line) == {"type": "step", "step": 2}
 
-    def test_headed_never_enables_demo_mode(self):
-        # demo_mode makes browser-use sleep 30s before returning the result.
-        captured: dict[str, Any] = {}
+    def test_ignores_unrelated_output(self):
+        assert ComputerUse._parse_event(b"INFO some library chatter\n") is None
 
-        def factory(**kwargs: Any) -> Any:
-            captured.update(kwargs)
-            return kwargs
+    def test_ignores_malformed_json(self):
+        assert ComputerUse._parse_event((SENTINEL + "{not json").encode()) is None
 
-        _tool()._make_browser_profile(headless=False, profile_factory=factory)
-        assert captured["headless"] is False
-        assert captured["demo_mode"] is False
+
+class TestHeartbeat:
+    def test_reports_launching_before_first_step(self):
+        message = ComputerUse._heartbeat(9.0, 0, 12)
+        assert "launching browser" in message
+        assert "step 1/12" in message
+
+    def test_reports_waiting_once_steps_land(self):
+        message = ComputerUse._heartbeat(9.0, 2, 12)
+        assert "waiting on browser/model" in message
+        assert "step 3/12" in message
 
 
 class TestPrompt:
