@@ -268,12 +268,17 @@ class TestPrompt:
 
 
 class TestAvailability:
-    def test_hidden_without_browser_use(self, monkeypatch: pytest.MonkeyPatch):
+    def test_available_with_api_key_even_without_browser_use(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
         monkeypatch.setattr(
             "vibe.core.tools.builtins.computer_use.importlib.util.find_spec",
             lambda _name: None,
         )
-        assert not ComputerUse.is_available()
+        monkeypatch.setattr(
+            "vibe.core.tools.builtins.computer_use.resolve_api_key", lambda _key: "k"
+        )
+        assert ComputerUse.is_available()
 
     def test_hidden_without_api_key(self, monkeypatch: pytest.MonkeyPatch):
         monkeypatch.setattr(

@@ -27,5 +27,6 @@ Notes:
   agent's reasoning, and a `summary` of what it achieved or could not achieve.
 - Sites with aggressive bot protection may show a CAPTCHA or block the browser outright.
   That surfaces in the trace; it is an environment limit, not a task failure.
-- Requires the optional `browser-use` dependency and a Chromium install. The tool hides
-  itself when either is missing.
+- Uses your installed Google Chrome or Chromium (via CDP). On first use, Vibe installs the
+  `browser-use` Python package automatically — no Playwright or separate browser download.
+- Requires `MISTRAL_API_KEY` for the vision model driving the browser.

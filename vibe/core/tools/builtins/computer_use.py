@@ -4,6 +4,8 @@ import asyncio
 from collections.abc import AsyncGenerator
 import importlib.util
 import os
+import shutil
+import sys
 from typing import TYPE_CHECKING, Any, final
 from urllib.parse import urlparse
 
@@ -36,6 +38,7 @@ _STEP_CAP = 40
 _WALL_TIMEOUT_SECONDS = 120
 _HEARTBEAT_SECONDS = 3.0
 _QUEUE_POLL_SECONDS = 0.25
+_BROWSER_USE_PACKAGE = "browser-use==0.13.8"
 
 
 class ComputerUseStep(BaseModel):
@@ -168,9 +171,45 @@ class ComputerUse(
 
     @classmethod
     def is_available(cls, config: VibeConfigSchema | None = None) -> bool:
-        if importlib.util.find_spec("browser_use") is None:
-            return False
         return bool(resolve_api_key(DEFAULT_MISTRAL_API_ENV_KEY))
+
+    @staticmethod
+    def _browser_use_installed() -> bool:
+        return importlib.util.find_spec("browser_use") is not None
+
+    @staticmethod
+    async def _install_browser_use() -> None:
+        if shutil.which("uv"):
+            cmd = ["uv", "pip", "install", _BROWSER_USE_PACKAGE]
+        else:
+            cmd = [sys.executable, "-m", "pip", "install", _BROWSER_USE_PACKAGE]
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await proc.communicate()
+        if proc.returncode != 0:
+            detail = (stderr or stdout).decode().strip()
+            raise ToolError(
+                "Could not install browser-use automatically. "
+                "Run `uv pip install browser-use` and retry. "
+                f"{detail}"
+            )
+        if not ComputerUse._browser_use_installed():
+            raise ToolError(
+                "browser-use install finished but the package is still missing. "
+                "Run `uv pip install browser-use` and retry."
+            )
+
+    @staticmethod
+    def _ensure_chrome() -> None:
+        chrome_module = importlib.import_module("browser_use.browser.chrome")
+        if chrome_module.find_chrome_executable() is None:
+            raise ToolError(
+                "Google Chrome or Chromium is required but was not found on this machine. "
+                "Install Chrome, then retry computer_use."
+            )
 
     @staticmethod
     def _normalize_url(url: str) -> str:
@@ -275,11 +314,15 @@ class ComputerUse(
     async def run(
         self, args: ComputerUseArgs, ctx: InvokeContext | None = None
     ) -> AsyncGenerator[ToolStreamEvent | ComputerUseResult, None]:
-        if importlib.util.find_spec("browser_use") is None:
-            raise ToolError(
-                "browser-use is not installed. Install it with "
-                "`uv pip install browser-use` then `playwright install chromium`."
+        if not self._browser_use_installed():
+            yield self._stream_event(
+                "First run: installing browser-use "
+                "(uses your system Chrome — no Playwright)…",
+                ctx,
             )
+            await self._install_browser_use()
+
+        self._ensure_chrome()
 
         agent_factory, chat_factory, profile_factory = self._load_browser_modules()
 
@@ -499,7 +542,7 @@ class ComputerUse(
 
     @classmethod
     def get_status_text(cls) -> str:
-        return "Launching Chromium…"
+        return "Driving browser…"
 
 
 def _call_or_default(target: Any, method_name: str, default: Any) -> Any:
